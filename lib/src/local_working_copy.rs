@@ -89,6 +89,11 @@ use crate::fsmonitor::FsmonitorSettings;
 use crate::fsmonitor::WatchmanConfig;
 #[cfg(feature = "watchman")]
 use crate::fsmonitor::watchman;
+use crate::gitattributes::DiskFileLoader;
+use crate::gitattributes::GitAttributes;
+use crate::gitattributes::GitAttributesFilter as _;
+use crate::gitattributes::SearchPriority;
+use crate::gitattributes::TreeFileLoader;
 use crate::gitignore::GitIgnoreFile;
 use crate::lock::FileLock;
 use crate::matchers::DifferenceMatcher;
@@ -111,6 +116,7 @@ use crate::ref_name::WorkspaceNameBuf;
 use crate::repo_path::RepoPath;
 use crate::repo_path::RepoPathBuf;
 use crate::repo_path::RepoPathComponent;
+use crate::settings::GitSettings;
 use crate::settings::UserSettings;
 use crate::store::Store;
 use crate::working_copy::CheckoutError;
@@ -938,6 +944,9 @@ pub struct TreeStateSettings {
     pub exec_change_setting: ExecChangeSetting,
     /// The fsmonitor (e.g. Watchman) to use, if any.
     pub fsmonitor_settings: FsmonitorSettings,
+
+    /// Ignore filters in .gitattributes
+    pub ignore_filters: Vec<String>,
 }
 
 impl TreeStateSettings {
@@ -948,6 +957,7 @@ impl TreeStateSettings {
             eol_conversion_mode: EolConversionMode::try_from_settings(user_settings)?,
             exec_change_setting: user_settings.get("working-copy.exec-bit-change")?,
             fsmonitor_settings: FsmonitorSettings::from_settings(user_settings)?,
+            ignore_filters: GitSettings::from_settings(user_settings)?.ignore_filters,
         })
     }
 }
@@ -972,6 +982,10 @@ pub struct TreeState {
     exec_policy: ExecChangePolicy,
     fsmonitor_settings: FsmonitorSettings,
     target_eol_strategy: TargetEolStrategy,
+
+    // attributes
+    git_attributes: Arc<GitAttributes>,
+    ignore_filters: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -1032,14 +1046,21 @@ impl TreeState {
             eol_conversion_mode,
             exec_change_setting,
             ref fsmonitor_settings,
+            ref ignore_filters,
         }: &TreeStateSettings,
     ) -> Self {
         let exec_policy = ExecChangePolicy::new(exec_change_setting, &state_path);
+        let tree = store.empty_merged_tree();
+
+        let store_file_loader = TreeFileLoader::new(tree.clone());
+        let disk_file_loader = DiskFileLoader::new(working_copy_path.clone());
+
+        let git_attributes = Arc::new(GitAttributes::new(store_file_loader, disk_file_loader));
         Self {
             store: store.clone(),
             working_copy_path,
             state_path,
-            tree: store.empty_merged_tree(),
+            tree,
             file_states: FileStatesMap::new(),
             sparse_patterns: vec![RepoPathBuf::root()],
             own_mtime: MillisSinceEpoch(0),
@@ -1049,6 +1070,9 @@ impl TreeState {
             exec_policy,
             fsmonitor_settings: fsmonitor_settings.clone(),
             target_eol_strategy: TargetEolStrategy::new(eol_conversion_mode),
+            // TODO We should update git_attributes every time TreeState::tree_id is updated
+            git_attributes,
+            ignore_filters: ignore_filters.clone(),
         }
     }
 
@@ -1292,6 +1316,8 @@ impl TreeState {
                 error: OnceLock::new(),
                 progress,
                 max_new_file_size,
+                git_attributes: self.git_attributes.clone(),
+                ignore_filters: self.ignore_filters.clone(),
             };
             let directory_to_visit = DirectoryToVisit {
                 dir: RepoPathBuf::root(),
@@ -1440,6 +1466,9 @@ struct FileSnapshotter<'a> {
     error: OnceLock<SnapshotError>,
     progress: Option<&'a SnapshotProgress<'a>>,
     max_new_file_size: u64,
+
+    git_attributes: Arc<GitAttributes>,
+    ignore_filters: Vec<String>,
 }
 
 impl FileSnapshotter<'_> {
@@ -1578,9 +1607,19 @@ impl FileSnapshotter<'_> {
             if let Some(progress) = self.progress {
                 progress(&path);
             }
-            if maybe_current_file_state.is_none()
-                && (git_ignore.matches(path.as_internal_file_string())
-                    && !self.force_tracking_matcher.matches(&path))
+
+            if self
+                .git_attributes
+                .filter_matches(&path, &self.ignore_filters, SearchPriority::Disk)
+                .block_on()
+            {
+                // Skip gitattributes files that we want to ignore - this
+                // would result in them showing up as deleted, but we also
+                // omit them in `emit_deleted_files` to avoid that.
+                Ok(None)
+            } else if maybe_current_file_state.is_none()
+                && git_ignore.matches(path.as_internal_file_string())
+                && !self.force_tracking_matcher.matches(&path)
             {
                 // If it wasn't already tracked and it matches
                 // the ignored paths, then ignore it.
@@ -1718,6 +1757,13 @@ impl FileSnapshotter<'_> {
             .flat_map(|(_, chunk)| chunk)
             // Whether or not the entry exists, submodule should be ignored
             .filter(|(_, state)| state.file_type != FileType::GitSubmodule)
+            // Whether or not the entry exists, ignored gitattributes files should be omitted
+            .filter(|(path, _)| {
+                !self
+                    .git_attributes
+                    .filter_matches(path, &self.ignore_filters, SearchPriority::Disk)
+                    .block_on()
+            })
             .filter(|(path, _)| self.matcher.matches(path))
             .try_for_each(|(path, _)| self.deleted_files_tx.send(path.to_owned()))
             .ok();
