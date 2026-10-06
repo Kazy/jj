@@ -141,7 +141,7 @@ fn assert_divergent_changes(
         .map(|(change_id, commits)| {
             (
                 (*change_id).clone(),
-                commits.iter().map(|c| c.id().clone()).collect(),
+                commits.iter().map(|c| c.id().clone()).sorted().collect(),
             )
         })
         .collect();
@@ -149,7 +149,12 @@ fn assert_divergent_changes(
     let simplified: HashMap<ChangeId, Vec<CommitId>> = actual
         .clone()
         .into_iter()
-        .map(|(change_id, commits)| (change_id, commits.iter().map(|c| c.id().clone()).collect()))
+        .map(|(change_id, commits)| {
+            (
+                change_id,
+                commits.iter().map(|c| c.id().clone()).sorted().collect(),
+            )
+        })
         .collect();
     assert_eq!(simplified, expected_divergent_commits);
     Ok(actual)
@@ -262,10 +267,10 @@ fn test_find_divergent_changes_exactly_one_found() -> TestResult {
     };
 
     let repo = repo.reload_at_head().block_on()?;
-    assert_eq!(
-        find_divergent_changes(&repo, RevsetExpression::all()).block_on()?,
-        BTreeMap::from([(change_aa.clone(), vec![commit_2.clone(), commit_1.clone()])])
-    );
+    drop(assert_divergent_changes(
+        &repo,
+        &[(&change_aa, &[commit_2.clone(), commit_1.clone()])],
+    )?);
 
     Ok(())
 }
@@ -400,8 +405,8 @@ fn test_build_truncated_evolution_graph() -> TestResult {
             .graph
             .adjacent_nodes(commit1.id())
             .unwrap()
-            .collect::<Vec<_>>(),
-        &[commit2.id(), commit3.id()]
+            .collect::<HashSet<_>>(),
+        HashSet::from([commit2.id(), commit3.id()])
     );
     assert!(
         truncated_evolution_graph
